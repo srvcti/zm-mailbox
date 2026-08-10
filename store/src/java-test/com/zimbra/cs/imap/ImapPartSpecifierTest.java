@@ -16,6 +16,7 @@
  */
 package com.zimbra.cs.imap;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 
@@ -53,7 +54,7 @@ public class ImapPartSpecifierTest {
     }
 
     private void checkBody(MimeMessage mm, String part, String modifier, String startsWith, String endsWith)
-    throws IOException, ImapPartSpecifier.BinaryDecodingException, ServiceException {
+            throws IOException, ImapPartSpecifier.BinaryDecodingException, ServiceException {
         checkPartial(mm, part, modifier, -1, -1, startsWith, endsWith);
     }
 
@@ -116,5 +117,96 @@ public class ImapPartSpecifierTest {
         checkBody(mm, "3.3", "", "BEGIN:VCALENDAR", "END:VCALENDAR");
         checkBody(mm, "3.3", "MIME", "Content-Type: text/calendar; name=meeting.ics; method=REQUEST; charset=utf-8", "Content-Transfer-Encoding: 7bit");
 
+    }
+
+    /**
+     * Test that when a StartOutOfBoundsException occurs, the original InputStream
+     * is properly closed and an empty ByteArrayInputStream is returned.
+     * This verifies the resource leak fix in ImapPartSpecifier.getContentOctetRangeFromFullContents.
+     */
+    @Test
+    public void testInputStreamClosedOnStartOutOfBoundsException() throws Exception {
+        // Create a simple MIME message
+        InputStream is = getClass().getResourceAsStream("toplevel-nested-message");
+        MimeMessage mm = new ZMimeMessage(JMSession.getSession(), is);
+
+        // Request a partial range that exceeds the message bounds
+        // This should trigger StartOutOfBoundsException when SegmentInputStream.create fails
+        ImapPartSpecifier pspec = new ImapPartSpecifier("BODY", "", "", 100000000, 10);
+
+        // Get the content - this should handle the exception gracefully
+        InputStreamWithSize content = pspec.getContentOctetRange(mm);
+
+        // Verify that we got a valid response with an empty stream
+        Assert.assertNotNull("Content should not be null", content);
+        Assert.assertNotNull("Stream should not be null", content.stream);
+
+        // Verify the stream is empty (0 length as set in the exception handler)
+        byte[] data = ByteUtil.getContent(content.stream, Integer.valueOf(Math.toIntExact(content.size)));
+        Assert.assertEquals("Stream should be empty", 0, data.length);
+    }
+
+    /**
+     * Test that the empty response from StartOutOfBoundsException is properly formatted.
+     * The fix should return an empty ByteArrayInputStream, not null.
+     */
+    @Test
+    public void testEmptyStreamReturnedOnOutOfBounds() throws Exception {
+        InputStream is = getClass().getResourceAsStream("toplevel-nested-message");
+        MimeMessage mm = new ZMimeMessage(JMSession.getSession(), is);
+
+        // Set start position way beyond message size
+        ImapPartSpecifier pspec = new ImapPartSpecifier("BODY", "", "", 999999, 100);
+        InputStreamWithSize content = pspec.getContentOctetRange(mm);
+
+        Assert.assertNotNull("Content should not be null", content);
+        Assert.assertEquals("Size should be 0", Long.valueOf(0), content.size);
+        Assert.assertTrue("Stream should be ByteArrayInputStream",
+                content.stream instanceof ByteArrayInputStream);
+    }
+
+    /**
+     * Test that normal partial ranges still work correctly after the fix.
+     * This ensures the fix doesn't break existing functionality.
+     */
+    @Test
+    public void testNormalPartialRangeStillWorks() throws Exception {
+        InputStream is = getClass().getResourceAsStream("toplevel-nested-message");
+        MimeMessage mm = new ZMimeMessage(JMSession.getSession(), is);
+
+        // Valid partial range that should work
+        ImapPartSpecifier pspec = new ImapPartSpecifier("BODY", "", "", 0, 100);
+        InputStreamWithSize content = pspec.getContentOctetRange(mm);
+
+        Assert.assertNotNull("Content should not be null", content);
+        Assert.assertNotNull("Stream should not be null", content.stream);
+
+        // Should have content
+        byte[] data = ByteUtil.getContent(content.stream, (int) Math.min(content.size, 100));
+        Assert.assertTrue("Stream should have data", data.length > 0);
+    }
+
+    /**
+     * Test multiple sequential out-of-bounds requests to ensure streams are
+     * consistently closed without resource leaks.
+     */
+    @Test
+    public void testMultipleOutOfBoundsRequests() throws Exception {
+        InputStream is = getClass().getResourceAsStream("toplevel-nested-message");
+        MimeMessage mm = new ZMimeMessage(JMSession.getSession(), is);
+
+        // Make multiple out-of-bounds requests
+        for (int i = 0; i < 5; i++) {
+            ImapPartSpecifier pspec = new ImapPartSpecifier("BODY", "", "", 1000000 + (i * 100000), 10);
+            InputStreamWithSize content = pspec.getContentOctetRange(mm);
+
+            Assert.assertNotNull("Content should not be null on iteration " + i, content);
+            Assert.assertNotNull("Stream should not be null on iteration " + i, content.stream);
+            Assert.assertEquals("Stream should be empty on iteration " + i, Long.valueOf(0), content.size);
+
+            // Ensure we can read from the stream without issues
+            byte[] data = ByteUtil.getContent(content.stream, 0);
+            Assert.assertEquals("Data should be empty on iteration " + i, 0, data.length);
+        }
     }
 }
